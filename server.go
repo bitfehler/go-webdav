@@ -1,6 +1,7 @@
 package webdav
 
 import (
+	"context"
 	"encoding/xml"
 	"io"
 	"net/http"
@@ -233,4 +234,97 @@ func (b *backend) Move(r *http.Request, dest *internal.Href, overwrite bool) (cr
 		return false, &internal.HTTPError{http.StatusPreconditionFailed, err}
 	}
 	return created, err
+}
+
+// BackendSuppliedHomeSet represents either a CalDAV calendar-home-set or a
+// CardDAV addressbook-home-set. It should only be created via
+// `caldav.NewCalendarHomeSet()` or `carddav.NewAddressbookHomeSet()`. Only to
+// be used server-side, for listing a user's home sets as determined by the
+// (external) backend.
+type BackendSuppliedHomeSet interface {
+	GetXMLName() xml.Name
+}
+
+// UserPrincipalBackend can determine the current user's principal URL for a
+// given request context.
+type UserPrincipalBackend interface {
+	CurrentUserPrincipal(ctx context.Context) (string, error)
+}
+
+type ServeUserPrincipalOptions struct {
+	UserPrincipalPath string
+	HomeSets          []BackendSuppliedHomeSet
+}
+
+// ServeUserPrincipal replies to discovery requests. It returns false if the
+// request wasn't handled.
+func ServeUserPrincipal(w http.ResponseWriter, r *http.Request, options ServeUserPrincipalOptions) bool {
+	if r.URL.Path == "/.well-known/carddav" || r.URL.Path == "/.well-known/caldav" {
+		http.Redirect(w, r, options.UserPrincipalPath, http.StatusMovedPermanently)
+		return true
+	}
+
+	if r.Method != "PROPFIND" {
+		return false
+	}
+
+	hh := internal.Handler{&serveUserPrincipalBackend{options}}
+	hh.ServeHTTP(w, r)
+	return true
+}
+
+type serveUserPrincipalBackend struct {
+	options ServeUserPrincipalOptions
+}
+
+func (b *serveUserPrincipalBackend) Propfind(r *http.Request, propfind *internal.Propfind, depth internal.Depth) (*internal.Multistatus, error) {
+	props := map[xml.Name]internal.PropfindFunc{
+		internal.CurrentUserPrincipalName: func(*internal.RawXMLValue) (interface{}, error) {
+			return &internal.CurrentUserPrincipal{Href: internal.Href{Path: b.options.UserPrincipalPath}}, nil
+		},
+	}
+
+	if r.URL.Path == b.options.UserPrincipalPath {
+		for _, homeSet := range b.options.HomeSets {
+			hs := homeSet // capture variable for closure
+			props[homeSet.GetXMLName()] = func(*internal.RawXMLValue) (interface{}, error) {
+				return hs, nil
+			}
+		}
+	}
+
+	resp, err := internal.NewPropfindResponse(r.URL.Path, propfind, props)
+	return internal.NewMultistatus(*resp), err
+}
+
+func (*serveUserPrincipalBackend) Options(r *http.Request) (caps []string, allow []string, err error) {
+	panic("Not implemented")
+}
+
+func (*serveUserPrincipalBackend) HeadGet(w http.ResponseWriter, r *http.Request) error {
+	panic("Not implemented")
+}
+
+func (*serveUserPrincipalBackend) Proppatch(r *http.Request, pu *internal.Propertyupdate) (*internal.Response, error) {
+	panic("Not implemented")
+}
+
+func (*serveUserPrincipalBackend) Put(r *http.Request) (*internal.Href, error) {
+	panic("Not implemented")
+}
+
+func (*serveUserPrincipalBackend) Delete(r *http.Request) error {
+	panic("Not implemented")
+}
+
+func (*serveUserPrincipalBackend) Mkcol(r *http.Request) error {
+	panic("Not implemented")
+}
+
+func (*serveUserPrincipalBackend) Copy(r *http.Request, dest *internal.Href, recursive, overwrite bool) (created bool, err error) {
+	panic("Not implemented")
+}
+
+func (*serveUserPrincipalBackend) Move(r *http.Request, dest *internal.Href, overwrite bool) (created bool, err error) {
+	panic("Not implemented")
 }
