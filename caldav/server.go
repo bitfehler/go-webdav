@@ -1,6 +1,7 @@
 package caldav
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"fmt"
@@ -85,7 +86,7 @@ func (h *Handler) handleReport(w http.ResponseWriter, r *http.Request) error {
 	if report.Query != nil {
 		return h.handleQuery(r, w, report.Query)
 	} else if report.Multiget != nil {
-		return h.handleMultiget(w, report.Multiget)
+		return h.handleMultiget(r.Context(), w, report.Multiget)
 	}
 	return internal.HTTPErrorf(http.StatusBadRequest, "caldav: expected calendar-query or calendar-multiget element in REPORT request")
 }
@@ -158,6 +159,44 @@ func decodeCompFilter(el *compFilter) (*CompFilter, error) {
 	return cf, nil
 }
 
+func decodeComp(comp *comp) (*CalendarCompRequest, error) {
+	if comp == nil {
+		return nil, internal.HTTPErrorf(http.StatusBadRequest, "caldav: unexpected empty calendar-data in request")
+	}
+	if comp.Allprop != nil && len(comp.Prop) > 0 {
+		return nil, internal.HTTPErrorf(http.StatusBadRequest, "caldav: only one of allprop or prop can be specified in calendar-data")
+	}
+	if comp.Allcomp != nil && len(comp.Comp) > 0 {
+		return nil, internal.HTTPErrorf(http.StatusBadRequest, "caldav: only one of allcomp or comp can be specified in calendar-data")
+	}
+
+	req := &CalendarCompRequest{
+		AllProps: comp.Allprop != nil,
+		AllComps: comp.Allcomp != nil,
+	}
+	for _, p := range comp.Prop {
+		req.Props = append(req.Props, p.Name)
+	}
+	for _, c := range comp.Comp {
+		comp, err := decodeComp(&c)
+		if err != nil {
+			return nil, err
+		}
+		req.Comps = append(req.Comps, *comp)
+	}
+	return req, nil
+}
+
+func decodeCalendarDataReq(calendarData *calendarDataReq) (*CalendarCompRequest, error) {
+	if calendarData.Comp == nil {
+		return &CalendarCompRequest{
+			AllProps: true,
+			AllComps: true,
+		}, nil
+	}
+	return decodeComp(calendarData.Comp)
+}
+
 func (h *Handler) handleQuery(r *http.Request, w http.ResponseWriter, query *calendarQuery) error {
 	var q CalendarQuery
 	// TODO: calendar-data in query.Prop
@@ -192,8 +231,42 @@ func (h *Handler) handleQuery(r *http.Request, w http.ResponseWriter, query *cal
 	return internal.ServeMultistatus(w, ms)
 }
 
-func (h *Handler) handleMultiget(w http.ResponseWriter, multiget *calendarMultiget) error {
-	panic("TODO")
+func (h *Handler) handleMultiget(ctx context.Context, w http.ResponseWriter, multiget *calendarMultiget) error {
+	var dataReq CalendarCompRequest
+	if multiget.Prop != nil {
+		var calendarData calendarDataReq
+		if err := multiget.Prop.Decode(&calendarData); err != nil && !internal.IsNotFound(err) {
+			return err
+		}
+		decoded, err := decodeCalendarDataReq(&calendarData)
+		if err != nil {
+			return err
+		}
+		dataReq = *decoded
+	}
+
+	var resps []internal.Response
+	for _, href := range multiget.Hrefs {
+		co, err := h.Backend.GetCalendarObject(ctx, href.Path, &dataReq)
+		if err != nil {
+			return err // TODO: create internal.Response with error
+		}
+
+		b := backend{h.Backend}
+		propfind := internal.Propfind{
+			Prop:     multiget.Prop,
+			AllProp:  multiget.AllProp,
+			PropName: multiget.PropName,
+		}
+		resp, err := b.propfindCalendarObject(&propfind, co)
+		if err != nil {
+			return err
+		}
+		resps = append(resps, *resp)
+	}
+
+	ms := internal.NewMultistatus(resps...)
+	return internal.ServeMultistatus(w, ms)
 }
 
 type backend struct {
@@ -240,11 +313,12 @@ func (b *backend) Options(r *http.Request) (caps []string, allow []string, err e
 }
 
 func (b *backend) HeadGet(w http.ResponseWriter, r *http.Request) error {
-	isResourceRequest, err := webdav.IsResourceRequest(r, b.UserPrincipalBackend)
+	homeSetPath, err := b.Backend.CalendarHomeSetPath(r.Context())
 	if err != nil {
 		return err
 	}
-	if !isResourceRequest {
+
+	if !strings.HasPrefix(r.URL.Path, homeSetPath) {
 		return &internal.HTTPError{Code: http.StatusMethodNotAllowed}
 	}
 
@@ -365,7 +439,34 @@ func (b *backend) propfindCalendar(propfind *internal.Propfind, cal *Calendar) (
 }
 
 func (b *backend) propfindCalendarObject(propfind *internal.Propfind, co *CalendarObject) (*internal.Response, error) {
-	panic("TODO")
+	props := map[xml.Name]internal.PropfindFunc{
+		internal.GetContentTypeName: func(*internal.RawXMLValue) (interface{}, error) {
+			return &internal.GetContentType{Type: ical.MIMEType}, nil
+		},
+		// TODO: calendar-data can only be used in REPORT requests
+		calendarDataName: func(*internal.RawXMLValue) (interface{}, error) {
+			var buf bytes.Buffer
+			if err := ical.NewEncoder(&buf).Encode(co.Data); err != nil {
+				return nil, err
+			}
+
+			return &calendarDataResp{Data: buf.Bytes()}, nil
+		},
+	}
+
+	if !co.ModTime.IsZero() {
+		props[internal.GetLastModifiedName] = func(*internal.RawXMLValue) (interface{}, error) {
+			return &internal.GetLastModified{LastModified: internal.Time(co.ModTime)}, nil
+		}
+	}
+
+	if co.ETag != "" {
+		props[internal.GetETagName] = func(*internal.RawXMLValue) (interface{}, error) {
+			return &internal.GetETag{ETag: internal.ETag(co.ETag)}, nil
+		}
+	}
+
+	return internal.NewPropfindResponse(co.Path, propfind, props)
 }
 
 func (b *backend) Proppatch(r *http.Request, update *internal.Propertyupdate) (*internal.Response, error) {
@@ -373,11 +474,12 @@ func (b *backend) Proppatch(r *http.Request, update *internal.Propertyupdate) (*
 }
 
 func (b *backend) Put(r *http.Request) (*internal.Href, error) {
-	isResourceRequest, err := webdav.IsResourceRequest(r, b.UserPrincipalBackend)
+	homeSetPath, err := b.Backend.CalendarHomeSetPath(r.Context())
 	if err != nil {
 		return nil, err
 	}
-	if !isResourceRequest {
+
+	if !strings.HasPrefix(r.URL.Path, homeSetPath) {
 		return nil, &internal.HTTPError{Code: http.StatusMethodNotAllowed}
 	}
 
