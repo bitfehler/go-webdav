@@ -4,6 +4,7 @@
 package caldav
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/emersion/go-ical"
@@ -13,6 +14,58 @@ import (
 
 func NewCalendarHomeSet(path string) webdav.BackendSuppliedHomeSet {
 	return &calendarHomeSet{Href: internal.Href{Path: path}}
+}
+
+// ValidateCalendarObject checks the validity of a calendar object according to
+// the contraints layed out in
+// https://datatracker.ietf.org/doc/html/rfc4791#section-4.1 and returns the
+// only event type and UID occuring in this calendar, or an error if the
+// calendar could not be validated.
+func ValidateCalendarObject(cal *ical.Calendar) (string, string, error) {
+	var eventType string
+	var uid string
+
+	for _, comp := range cal.Children {
+		// Calendar object resources contained in calendar collections
+		// MUST NOT contain more than one type of calendar component
+		// (e.g., VEVENT, VTODO, VJOURNAL, VFREEBUSY, etc.) with the
+		// exception of VTIMEZONE components, which MUST be specified
+		// for each unique TZID parameter value specified in the
+		// iCalendar object.
+		if comp.Name != ical.CompTimezone {
+			if eventType == "" {
+				eventType = comp.Name
+			}
+			if eventType != comp.Name {
+				return "", "", fmt.Errorf(
+					"conflicting event types in calendar: %s, %s",
+					eventType, comp.Name)
+			}
+			// TODO check VTIMEZONE for each TZID?
+		}
+
+		// Calendar object resources contained in calendar collections
+		// MUST NOT specify the iCalendar METHOD property.
+		if prop := comp.Props.Get(ical.PropMethod); prop != nil {
+			return "", "", fmt.Errorf(
+				"calendar resource must not specify METHOD property")
+		}
+
+		// Calendar components in a calendar collection that have
+		// different UID property values MUST be stored in separate
+		// calendar object resources.
+		if prop := comp.Props.Get(ical.PropUID); prop != nil {
+			if uid == "" {
+				uid = prop.Value
+			}
+			if uid != prop.Value {
+				return "", "", fmt.Errorf(
+					"conflicting UID values in calendar: %s, %s",
+					uid, prop.Value)
+			}
+		}
+	}
+	return eventType, uid, nil
 }
 
 type Calendar struct {
