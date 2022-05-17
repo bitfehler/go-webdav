@@ -381,7 +381,16 @@ func (b *backend) Propfind(r *http.Request, propfind *internal.Propfind, depth i
 			}
 		}
 	} else {
-		// TODO
+		co, err := b.Backend.GetCalendarObject(r.Context(), r.URL.Path, &compReq)
+		if err != nil {
+			return nil, err
+		}
+
+		resp, err := b.propfindCalendarObject(r.Context(), propfind, co)
+		if err != nil {
+			return nil, err
+		}
+		resps = append(resps, *resp)
 	}
 
 	return internal.NewMultistatus(resps...), nil
